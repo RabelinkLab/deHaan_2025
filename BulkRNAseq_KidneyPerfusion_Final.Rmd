@@ -1,0 +1,1185 @@
+---
+title: "Normothermic human kidney preservation provokes iron accumulation and ferroptosis"
+author: "de Haan, Jacobs et al."
+date: "2025-02-10"
+output:
+  html_document:
+    toc: true
+    toc_float: true   # Optional: Makes the TOC float on the side
+    number_sections: true  # Optional: Number the sections
+  pdf_document:
+    toc: true
+    number_sections: true  # Optional: Number sections in PDF
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Required libraries
+```{r Required libraries, eval = FALSE}
+{library(biomaRt)
+library(ggplot2)
+library(Rsubread)
+library(fgsea)
+library(pheatmap)
+library(ComplexHeatmap)
+library(tidyr)
+library(dplyr)
+library(tibble)
+library(purrr)
+library(DESeq2)
+library(UpSetR)
+library(GSVA)
+library(ggrepel)
+library(circlize)
+library(data.table)
+library(ggdendro)
+library(pathview)
+library(org.Hs.eg.db)
+library(BiocParallel)
+library(devEMF)
+library(svglite)
+library(ggvenn)
+library(grid)
+library(scales)}
+
+# Load metadata 
+col_meta2 <- read_delim("/Metadata.csv", delim = ";", escape_double = FALSE, locale = locale(decimal_mark =",", grouping_mark = "."), trim_ws = TRUE)
+```
+
+# Setup Conda and index
+```{r Setup_conda, eval = FALSE}
+conda create -n bulk python
+conda activate bulk
+conda install -c bioconda fastqc
+conda install -c bioconda multiqc
+
+# Build the index using GRCh38.p14 from ensembl
+buildindex(basename = "hg38_Ref", reference = "genome.fa")
+
+## Example for 1 sample 
+# Align 2 readfiles onto the reference
+align(
+    index = "hg38_Ref",
+    readfile1 = "/AA4_1.fq.gz",
+    readfile2 = "/AA4_2.fq.gz",
+    output_file = "/bam/AA4.bam",
+    input_format = "FASTQ",
+    type = "rna",
+    nthreads = 10
+)
+
+# Samtools
+samtools sort -o AA1.sorted.bam AA1.bam
+samtools index AA1.sorted.bam
+
+# QC
+fastqc *.fq.gz
+multiqc . 
+```
+
+# Count matrix and DDS
+```{r Count_matrix_and_DDS, eval = FALSE}
+# Find all sorted.bam files
+bam_files <- list.files(path = "./bam", pattern = "\\.sorted\\.bam$", full.names = TRUE)
+
+#Where to annotate onto
+gtf_file <- "/reference/hg38p14/genome.gtf"
+
+#Big count matrix using RSubread
+fc_results <- featureCounts(
+  files = bam_files,
+  annot.ext = gtf_file,
+  isGTFAnnotationFile = TRUE,
+  GTF.featureType = "exon",     # Specify the feature type to count (e.g., "exon")
+  GTF.attrType = "gene_id",  # Use gene_name instead of gene_id
+  useMetaFeatures = TRUE,      # Aggregate counts at the gene level
+  isPairedEnd = TRUE,          # Count read pairs for paired-end data
+  nthreads = 10                # Use 10 threads for faster processing
+)
+
+count_matrix <- as.data.frame(fc_results$counts)
+# ENSG to readable names 
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+gene_ids <- rownames(count_matrix) 
+gene_names <- getBM(attributes = c("ensembl_gene_id", "external_gene_name"),
+                    filters = "ensembl_gene_id",
+                    values = gene_ids,
+                    mart = ensembl)
+
+# Merge the gene names with the count matrix
+count_df_with_names <- merge(count_matrix, gene_names, by.x = "row.names", by.y = "ensembl_gene_id", all.x = TRUE)
+
+# Merge readable genenames that are spread over multiple rows 
+valid_counts <- count_df_with_names %>%
+  filter(!is.na(external_gene_name) & external_gene_name != "") %>%
+  group_by(external_gene_name) %>%
+  summarise(
+    Row.names = paste(unique(Row.names), collapse = ","), # Combine ENSG IDs with commas
+    across(where(is.numeric), sum, na.rm = TRUE),         # Sum numeric columns
+    .groups = "drop"
+  )
+# Keep rows with invalid external_gene_name unchanged
+invalid_counts <- count_df_with_names %>%
+  filter(is.na(external_gene_name) | external_gene_name == "") 
+# Combine the valid and invalid counts
+merged_counts <- bind_rows(valid_counts, invalid_counts)
+###write.csv(merged_counts, "merged_counts.csv")
+
+# Remove everything that doesn't have a name
+# Remove all MT
+merged_counts_clean <- subset(
+  merged_counts,
+  external_gene_name != "" & !grepl("^MT-", external_gene_name)
+)
+df <- merged_counts_clean[,4:(ncol(merged_counts_clean))]
+rownames(df) <- merged_counts_clean$external_gene_name
+df <- as.matrix(df)
+colnames(df) <- sub("\\.sorted\\.bam$", "", colnames(df))
+
+col_meta2 <- read_delim("/Metadata.csv", delim = ";", escape_double = FALSE, trim_ws = TRUE)
+
+col_meta2$Time <- factor(col_meta2$Time)
+col_meta2$Dialysis <- factor(col_meta2$Dialysis)
+col_meta2$Gender <- factor(col_meta2$Gender)
+col_meta2$Donor <- factor(col_meta2$Donor)
+col_meta2$Preservation <- factor(col_meta2$Preservation)
+col_meta2$Paired <- factor(col_meta2$Paired)
+col_meta2$Time_Concat <- factor(col_meta2$Time_Concat)
+
+# Filter out genes that don't meet the threshold
+gene_sums <- rowMeans(df)
+threshold <- 3 * nrow(col_meta2)
+df_filtered <- df[gene_sums >= threshold, ]
+
+# Make DESeqDataSet using the filtered data
+dds <- DESeqDataSetFromMatrix(countData = df_filtered,
+                              colData = col_meta2,
+                              design = ~ Donor + Preservation + Time)
+dds <- DESeq(dds)
+#saveRDS(dds, "dds.RDS")
+```
+
+# Import Gene Sets 
+```{r Gene_sets, eval = FALSE}
+# From https://www.gsea-msigdb.org/gsea/msigdb
+pathways.hall <- gmtPathways("h.all.v2024.1.Hs.symbols.gmt.txt")
+pathways.cp <- gmtPathways("c2.cp.v2024.1.Hs.symbols.gmt.txt")
+pathways.tft <- gmtPathways("c3.tft.v2024.1.Hs.symbols.gmt.txt")
+pathways.bp <- gmtPathways("c5.go.bp.v2024.1.Hs.symbols.gmt.txt")
+pathways.mf <- gmtPathways("c5.go.mf.v2024.1.Hs.symbols.gmt.txt")
+pathways.react <- gmtPathways("c2.cp.reactome.v2024.1.Hs.symbols.gmt.txt")
+
+pathways_list <- list(
+  "hallmark" = pathways.hall,
+  "cp" = pathways.cp,
+  "tft" = pathways.tft,
+  "bp" = pathways.bp,
+  "mf" = pathways.mf,
+  "react" = pathways.react)
+
+# Pathways of interest 
+WP_FERROPTOSIS <- pathways.cp[["WP_FERROPTOSIS"]]
+GOBP_IRON_ION_TRANSPORT <- pathways.bp[["GOBP_IRON_ION_TRANSPORT"]]
+
+# Ferrdb pathways
+ferrdb_driver <-  c("RPL8", "IREB2", "ATP5MC3", "CS", "EMC2", "ACSF2", "G6PD", "PGD", "VDAC2", "PIK3CA", "FLT3",   "SCP2", "TP53", "TF", "TFRC", "TFR2", "SLC38A1", "SLC1A5", "GLS2", "GOT1", "CARS1", "TP53",   "ALOX5", "KEAP1", "HMOX1", "TP53", "TP53", "GLS2", "ATG5", "ATG7", "NCOA4", "TF", "ALOX5",   "ALOX12", "ALOX12B", "ALOX15", "ALOX15B", "ALOXE3", "PHKG2", "ULK1", "ATG3", "ATG5", "ATG13",   "ULK2", "NCOA4", "ACSL4", "TP53", "SAT1", "ALOX15", "ACSL4", "LPCAT3", "ALOX15", "ACSL4",   "KEAP1", "EGFR", "NOX4", "MAPK3", "MAPK1", "BID", "ACSL4", "ZEB1", "KEAP1", "DPP4", "ALOX15",   "ALOX12", "CDKN2A", "PEBP1", "SOCS1", "CDO1", "MYB", "HMOX1", "MAPK8", "MAPK9", "MAPK1", "MAPK3", "SLC1A5", "CHAC1", "MAPK14", "NOX4", "GOT1", "BECN1", "PRKAA2", "PRKAA1", "ELAVL1",   "BAP1", "TP53", "ABCC1", "ACSL4", "ACVR1B", "TGFBR1", "BAP1", "EPAS1", "HILPDA", "HIF1A", "ALOX12", "ACSL4", "HMOX1", "IFNG", "ANO6", "LPIN1", "HMGB1", "TNFAIP3", "TLR4", "NOX4", "ATF3", "ATM", "YY1AP1", "EGLN2", "MIOX", "TAFAZZIN", "MTDH", "IDH1", "TAFAZZIN", "BECN1",   "PANX1", "BACH1", "ACSL4", "LONP1", "CD82", "IL1B", "CTSB", "POR", "CYB5R1", "ELOVL5", "FADS1", "FBXW7", "TBK1", "IL6", "USP7", "ATF4", "PEX10", "PEX12", "AGPS", "PEX2", "FAR1",  "PEX3", "ZEB1", "SIRT1", "SLC39A14", "MAP3K11", "GSK3B", "MAPK8", "BRD7", "TP53", "SLC25A28", "ACSL4", "MFN2", "ACSL4", "SLC11A2", "TSC1", "PEBP1", "SNCA", "SIRT3", "PRKAA2", "TFRC",  "CGAS", "STING1", "HDDC3", "MDM2", "MDM4", "ALOX15", "POR", "DLD", "LONP1", "ACSL4", "BACH1", "DNAJB6", "WWTR1", "SIRT1", "ATM", "PRKCA", "LGMN", "ACSL4", "TP53", "IFNG", "SMPD1", "MYCN",   "SLC11A2", "SMG9", "NR1D1", "ACSL4", "PPARG", "TLR4", "IL6", "ATF3", "HMOX1", "HMGB1",  "EPAS1", "SNX5", "PAQR3", "MICU1", "NOX4", "MAP3K14", "SIRT3", "QSOX1", "MIB2", "CLTRN", "KLF2", "TFRC", "ELAVL1", "YTHDC2", "DDR2", "SLC39A7", "TRIM46", "ACSL1", "KDM5A", "TRIM21", "HMOX1", "DPEP1", "CYGB", "IDO1", "GSTZ1", "TP53", "ACO1", "GJA1", "IREB2", "SLC7A11", "PGRMC1", "CIRBP", "FAR1", "USP11", "STING1", "YAP1", "HMOX1", "TRIM26", "YAP1", "FADS2",  "PIEZO1", "LIFR", "PTPN6", "EGR1", "ADAM23", "ACSL4", "CPEB1", "COX4I2", "TIMP1", "KDM6B", "NCOA4", "GSK3B", "IFNG", "METTL14", "CHAC1", "MIB1", "KDM5C", "ACSL4", "CCDC6", "ATF3", "IREB2", "CFL1", "ALOXE3", "KMT2D")   
+
+ferrdb_suppressor <-  c("SLC7A11", "GPX4", "AKR1C1", "AKR1C2", "AKR1C3", "GPX4", "RB1", "HSPB1", "HSF1", "SLC7A11", "GPX4", "GCLC", "SLC7A11", "NFE2L2", "SQSTM1", "NQO1", "HMOX1", "FTH1", "MUC1", "SLC3A2", "MT1G", "SLC40A1", "SLC7A11", "GPX4", "SLC7A11", "CISD1", "SLC7A11", "FANCD2", "GPX4", "NFE2L2", "FTMT", "HSPA5", "ATF4", "SLC7A11", "GPX4", "GPX4", "HMOX1", "ATF4", "NFE2L2", "TP53", "SLC7A11", "HELLS", "SCD", "FADS2", "SRC", "STAT3", "NFE2L2", "PML", "MTOR", "NFS1", "TP63", "SLC7A11", "TP53", "CDKN1A", "SLC40A1", "GPX4", "ENPP2", "VDAC2", "FH", "CISD2", "SLC40A1", "CBS", "NFE2L2", "GPX4", "ISCU", "FTH1", "ACSL3", "OTUB1", "CD44", "STAT3", "BRD4", "PRDX6", "SCD", "SESN2", "NF2", "ARNTL", "HIF1A", "CA9", "HSPA5", "TMBIM4", "AIFM2", "AIFM2", "LAMP2", "ZFP36", "GPX4", "PROM2", "CHMP5", "CHMP6", "AKR1C1", "AKR1C2", "AKR1C3", "CBS", "NFE2L2", "CAV1", "GCH1", "SIRT3", "DAZAP1", "PIR", "GCLC", "FTL", "HCAR1", "SLC16A1", "RRM2", "SCD", "SREBF1", "SREBF2", "FZD7", "NFE2L2", "NFE2L2", "BCAT2", "HSF1", "PLA2G6", "PARK7", "FXN", "SUV39H1", "ATF2", "FTH1", "NFE2L2", "STAT3", "ACOT1", "NFE2L2", "ALDH3A2", "NFE2L2", "STK11", "CDH1", "NFE2L2", "NEDD4L", "SQSTM1", "TF", "FTMT", "SCD", "SLC7A11", "DECR1", "NFE2L2", "GPX4", "SLC7A11", "NFE2L2", "GLRX5", "GPX4", "GPX4", "PANX2", "TFAP2A", "CP", "SLC7A11", "ARF6", "GDF15", "ABHD12", "PPP1R13L", "TFAM", "KDM3B", "RNF113A", "PARK7", "FXN", "IDH2", "PPARA", "NOS2", "SIAH2", "RELA", "PRKAA2", "VDR", "NEDD4", "FXN", "AIFM2", "AR", "CBS", "NFE2L2", "CHMP5", "CHMP6", "HMOX1", "ZFP36", "LAMP2", "MTF1", "COPZ1", "NUPR1", "USP35", "HSF1", "PROM2", "PLA2G6", "HIF1A", "RRM2", "SLC7A11", "FTMT", "PDSS2", "TXN", "SENP1", "PLA2G6", "FGF21", "FTMT", "GOT1", "TFRC", "GPX4", "BEX1", "ASAH2", "SCD", "FABP4", "CDH1", "SIRT1", "TYRO3", "SIRT6", "KIF20A", "ECH1", "ETV4", "VCP", "ENPP2", "RBMS1", "KDM4A", "CBS", "MGST1", "PRDX6", "MPC1", "CHMP1A", "CAMKK2", "SOX2", "SRSF9", "PROK2", "SIRT2", "MEF2C", "NF2", "CDH1", "HSPB1", "EZH2", "PEDS1", "SMPD1", "ADAMTS13", "CDC25A", "G6PD", "SRSF9", "CAV1", "PPARD", "CISD2", "ENO3", "SESN2", "LCN2", "MARCHF5", "TRIB2", "DHODH", "SLC7A11", "OTUB1", "PDK4", "ADIPOQ", "GPX4", "IL6", "PTPN18", "FTH1", "FTH1", "FTL", "LCN2", "ABCC5", "CISD3", "MS4A15", "LCN2", "GALNT14", "KLHDC3", "GSTM1", "TERT", "RARRES2", "USP11")
+
+ferrdb_all <- c(ferrdb_driver, ferrdb_suppressor)
+ferrdb_all <- unique(ferrdb_all)
+
+ferrdb_marker <- c("PTGS2", "CHAC1", "SLC40A1", "TF", "TFRC", "FTH1", "GPX4", "HSPB1", "NFE2L2", "GPX4", "FTH1" )
+
+ferrdb_all_marker <- c(ferrdb_driver, ferrdb_suppressor, ferrdb_marker)
+ferrdb_all_marker <- unique(ferrdb_all_marker)
+
+# For response to peer review
+HALLMARK_INFLAMMATORY_RESPONSE <- pathways.hall[["HALLMARK_INFLAMMATORY_RESPONSE"]]
+HALLMARK_TNFA_SIGNALING_VIA_NFKB <- pathways.hall[["HALLMARK_TNFA_SIGNALING_VIA_NFKB"]]
+HALLMARK_IL6_JAK_STAT3_SIGNALING <- pathways.hall[["HALLMARK_IL6_JAK_STAT3_SIGNALING"]]
+```
+
+# Fig1-2 dds GroupA (RBC-based) 
+```{r Fig_1-2, eval = FALSE}
+# Chosen to keep size estimates the same in a dds subset, since sequencing depth is equal for each sample
+dds_GroupA <- dds[, !(dds$Group %in% c("B", "C"))]
+dds_GroupA$Time <- factor(dds_GroupA$Time, levels = c("0", "6", "24", "48"))  
+design(dds_GroupA) <- ~ Time
+dds_GroupA <- DESeq(dds_GroupA)
+```
+
+# Fig1K Key Iron channel dynamics
+```{r Key_Iron_channel_dynamics, eval = FALSE}
+
+Fe_Uptake <- c("CD44", "SLC39A14", "SLC39A8", "SLC11A2", "TFRC")
+Fe_Storage <- c("FTL", "FTH1")
+Fe_Export <- c("SLC40A1", "PROM2")
+Fe_Scavenging <- c("LCN2")
+Redox_defense <- c("GPX4", "HMOX1")
+
+Pathways_Fe <- list(Redox_defense = Redox_defense,
+                    Fe_Scavenging = Fe_Scavenging,
+                    Fe_Export = Fe_Export,
+                    Fe_Storage = Fe_Storage,
+                    Fe_Uptake = Fe_Uptake)
+
+res_6vs0 <- results(dds_GroupA, contrast = c("Time", "6", "0"))
+res_24vs0 <- results(dds_GroupA, contrast = c("Time", "24", "0"))
+res_48vs0 <- results(dds_GroupA, contrast = c("Time", "48", "0"))
+
+res_6vs0$gene <- rownames(res_6vs0)
+res_6vs0$comparison <- "6 vs 0"
+res_24vs0$gene <- rownames(res_24vs0)
+res_24vs0$comparison <- "24 vs 0"
+res_48vs0$gene <- rownames(res_48vs0)
+res_48vs0$comparison <- "48 vs 0"
+
+combined_res <- bind_rows(as.data.frame(res_6vs0), as.data.frame(res_24vs0), as.data.frame(res_48vs0))
+
+# Filter for Pathways_Fe list
+filtered_res <- combined_res %>% 
+  filter(gene %in% unlist(Pathways_Fe)) %>%
+  mutate(
+    pathway = case_when(
+      gene %in% Fe_Uptake ~ "Fe_Uptake",
+      gene %in% Fe_Storage ~ "Fe_Storage",
+      gene %in% Fe_Export ~ "Fe_Export",
+      gene %in% Fe_Scavenging ~ "Fe_Scavenging",
+      TRUE ~ NA_character_
+    ),
+    gene_label = factor(gene, levels = unlist(Pathways_Fe)),  # Order genes within pathways
+    pathway_label = factor(pathway, levels = names(Pathways_Fe)),  # Order pathways
+    border_color = ifelse(padj < 0.05, "black", "lightgray"),  # Border color for significance
+    comparison = factor(comparison, levels = c("6 vs 0", "24 vs 0", "48 vs 0"))  # Explicit order of comparisons
+  )
+
+# Dotplot visualization
+ggplot(filtered_res, aes(x = comparison, y = gene_label, fill = log2FoldChange, size = -log10(padj), color = border_color)) +
+  geom_point(shape = 21, stroke = 1.1) +  
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, na.value = "gray") +
+  scale_color_manual(values = c("black" = "black", "lightgray" = "lightgray"), guide = "none") +
+  scale_size_continuous(range = c(2, 8), limits = c(0.15, 35)) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 0, hjust = 0.5, vjust = 0.5, size = 13, color = "black"),  
+    axis.text.y = element_text(size = 11, , color = "black"),
+    panel.grid.major = element_line(color = "lightgray", linetype = "dotted"),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "gray", linewidth = 1, fill = NA),  
+    strip.text = element_text(size = 12),
+    plot.title = element_text(size = 15),
+    plot.margin = margin(10, 10, 10, 10),  # Adjust margins to avoid clipping
+  ) +
+  labs(x = NULL, y = NULL, fill = "Log2FC", size = "-Log10(padj)", color = NULL ) +
+  ggtitle(NULL) +
+  scale_x_discrete(labels = c("6 vs 0" = "T6", "24 vs 0" = "T24", "48 vs 0" = "T48"))
+```
+
+# Fig2J-K GSVA GroupA 
+```{r Fig2J-K_GSVA_GroupA, eval = FALSE}
+dds_GroupA <- dds[, !(dds$Group %in% c("B", "C"))]
+dds_GroupA$Time <- factor(dds_GroupA$Time, levels = c("0", "6", "24", "48"))  
+design(dds_GroupA) <- ~ Time
+dds_GroupA <- DESeq(dds_GroupA)
+
+normalized_counts <- counts(dds_GroupA, normalized=  TRUE)
+normalized_counts <- as.matrix(normalized_counts)
+log_transformed_counts <- log2(normalized_counts + 1)
+
+GSVA_of_interest <- c(
+  list( ferrdb_all_marker = ferrdb_all_marker,
+        WP_FERROPTOSIS = WP_FERROPTOSIS,
+        ))
+
+param <- gsvaParam(log_transformed_counts, GSVA_of_interest, minSize = 1)
+gsva_result <- gsva(param, verbose = TRUE)
+
+# Export GSVA results as CSV
+gsva_result_df <- as.data.frame(gsva_result)
+#write.csv(gsva_result_df, file = "GSVA_results_EndpointsAB.csv", row.names = TRUE)
+```
+
+# Fig2L DEG GroupA T0 T6 T24 T48 (Annotation from ferrdb v2) 
+```{r Fig2L_DEG_GroupA_T0_T6_T24_T48, eval = FALSE}
+time_points <- c("6", "24", "48")
+titles <- c("T6 vs T0", "T24 vs T0", "T48 vs T0")
+
+for (i in seq_along(time_points)) {
+    time <- time_points[i]
+    title <- titles[i] 
+
+    # Get results for the specified time point
+    res <- results(dds_GroupA, contrast = c("Time", time, "0"))
+    res <- data.frame(res)
+    res$Gene <- rownames(res)
+    res <- res[!is.na(res$padj), ]
+
+    # Add a color column based on conditions
+    res$dot_color <- ifelse(
+        res$Gene %in% ferrdb_marker & res$padj < 0.05, "black",  # Marker genes are black
+        ifelse(res$Gene %in% ferrdb_all_marker & res$padj < 0.05, "red",  # Other Ferrdb genes are red
+               "lightgray")  # Other genes are light gray
+    )
+
+    # Add labels for ferrdb_marker genes
+    res$label <- ifelse(res$Gene %in% ferrdb_marker, res$Gene, NA)
+    res$plot_order <- factor(res$dot_color, levels = c("lightgray", "red", "black"))
+    res <- res[order(res$plot_order), ]
+
+    plot <- ggplot() +
+        geom_point(data = res, aes(x = log2FoldChange, y = -log10(padj), color = dot_color), size = 1.5) +
+        geom_text_repel(data = res[!is.na(res$label), ],
+                        aes(x = log2FoldChange, y = -log10(padj), label = label),
+                        size = 3, max.overlaps = 20) +
+        labs(title = title, x = "Log2FC", y = "-Log10(padj)") +
+        theme_minimal() +
+        scale_color_identity(guide = "legend", name = NULL, 
+            breaks = c("black", "red", "lightgray"),
+            labels = c("Ferrdb marker (black)", "Ferrdb all marker (red)", "Other (gray)")) + 
+        xlim(-7.5, 7.5) +  
+        ylim(0, 40) +  
+        theme(
+        panel.border = element_rect(color = "black", linewidth = 1, fill = NA),
+        plot.title = element_text(hjust = 0.5, size = 16),
+        axis.title.x = element_text(size = 14),  
+        axis.title.y = element_text(size = 14),  
+        axis.text.x = element_text(size = 12),   
+        axis.text.y = element_text(size = 12),    
+        legend.text = element_text(size = 12),
+        legend.title = NULL) 
+    
+    plot_file <- paste0("GrA_T", time, "v0_plot.pdf")
+    ggsave(plot_file, plot, width = 5.5, height = 4, dpi = 300, device = "pdf")
+}
+```
+
+# Fig2M Ferroptosis signature genes dotplot 
+```{r Fig2_M_Ferroptosis_signature, eval = FALSE}
+time_points <- c("6", "24", "48")
+titles <- c("T6 vs T0", "T24 vs T0", "T48 vs T0")
+
+ferrdb_significant_genes <- list()
+
+for (i in seq_along(time_points)) {
+    time <- time_points[i]
+    title <- titles[i]
+
+    # Get results for the specified time point
+    res <- results(dds_GroupA, contrast = c("Time", time, "0"))
+    res <- data.frame(res)
+    res$Gene <- rownames(res)
+    res <- res[!is.na(res$padj), ]
+
+    # Filter for ferrdb_all genes with padj < 0.05 and abs(log2FoldChange) > 2
+    significant_res <- res[res$Gene %in% ferrdb_all_marker & res$padj < 0.05 & abs(res$log2FoldChange) > 2, ]
+
+    # Add the significant genes to the list, categorized by time point
+    ferrdb_significant_genes[[time]] <- significant_res$Gene
+}
+
+# Combine all significant genes
+all_ferrdb_significant_genes <- unique(unlist(ferrdb_significant_genes))
+
+# Extract results for multiple comparisons
+res_6vs0 <- results(dds_GroupA, contrast = c("Time", "6", "0"))
+res_24vs0 <- results(dds_GroupA, contrast = c("Time", "24", "0"))
+res_48vs0 <- results(dds_GroupA, contrast = c("Time", "48", "0"))
+
+# Add gene names and a column indicating the comparison
+res_6vs0$gene <- rownames(res_6vs0)
+res_6vs0$comparison <- "6 vs 0"
+
+res_24vs0$gene <- rownames(res_24vs0)
+res_24vs0$comparison <- "24 vs 0"
+
+res_48vs0$gene <- rownames(res_48vs0)
+res_48vs0$comparison <- "48 vs 0"
+
+# Combine the results from all comparisons
+combined_res <- bind_rows(as.data.frame(res_6vs0), as.data.frame(res_24vs0), as.data.frame(res_48vs0))
+
+# Filter combined results for significant FerrDB genes
+filtered_res <- combined_res %>% 
+  filter(gene %in% unlist(all_ferrdb_significant_genes)) %>% 
+  mutate(
+    gene_label = factor(gene, levels = sort(unique(gene))),  # Order genes alphabetically
+    border_color = ifelse(padj < 0.05, "black", "lightgray"),  # Border color for significance
+    comparison = factor(comparison, levels = c("48 vs 0", "24 vs 0", "6 vs 0"))  # Order comparisons explicitly
+  )
+
+# Create the dotplot
+ggplot(filtered_res, aes(x = gene_label, y = comparison, fill = log2FoldChange, size = -log10(padj), color = border_color)) +
+  geom_point(shape = 21, stroke = 1.1) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, na.value = "gray") +
+  scale_color_manual(values = c("black" = "black", "lightgray" = "lightgray"), guide = "none") +
+  scale_size_continuous(range = c(2, 8)) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, size = 11, color = "black"),  # Rotate X-axis text
+    axis.text.y = element_text(size = 13, color = "black"),
+    panel.grid.major = element_line(color = "lightgray", linetype = "dotted"),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "gray", linewidth = 1, fill = NA),
+    strip.text = element_text(size = 12),
+    plot.title = element_text(size = 15),
+    plot.margin = margin(10, 10, 10, 10)  # Adjust margins to avoid clipping
+  ) +
+  labs(x = NULL, y = NULL, fill = "Log2FC", size = "-Log10(padj)", color = NULL) +
+  scale_y_discrete(labels = c("6 vs 0" = "T6", "24 vs 0" = "T24", "48 vs 0" = "T48")) +
+  ggtitle("Ferroptosis Signature Genes")
+
+```
+
+# Reviewer 2 Q2 GroupA Ferroptosis marker genes dotplot (response to peer review)  
+```{r Rev2_Q2, eval = FALSE}
+# List of FerrDB genes that meets Log2FC 2 and padj<0.05 ##
+time_points <- c("6", "24", "48")
+titles <- c("T6 vs T0", "T24 vs T0", "T48 vs T0")
+
+# Extract results for multiple comparisons (6 vs 0, 24 vs 0, 48 vs 0)
+res_6vs0 <- results(dds_GroupA, contrast = c("Time", "6", "0"))
+res_24vs0 <- results(dds_GroupA, contrast = c("Time", "24", "0"))
+res_48vs0 <- results(dds_GroupA, contrast = c("Time", "48", "0"))
+
+# Add gene names and a column indicating the comparison
+res_6vs0$gene <- rownames(res_6vs0)
+res_6vs0$comparison <- "6 vs 0"
+
+res_24vs0$gene <- rownames(res_24vs0)
+res_24vs0$comparison <- "24 vs 0"
+
+res_48vs0$gene <- rownames(res_48vs0)
+res_48vs0$comparison <- "48 vs 0"
+
+# Combine the results from all comparisons
+combined_res <- bind_rows(as.data.frame(res_6vs0), as.data.frame(res_24vs0), as.data.frame(res_48vs0))
+
+# Filter combined results for genes in the ferrdb_marker list
+filtered_res <- combined_res %>% 
+  filter(gene %in% ferrdb_marker) %>%  # Use ferrdb_marker set
+  mutate(
+    gene_label = factor(gene, levels = rev(sort(ferrdb_marker))),  # Reverse alphabetical sorting
+    border_color = ifelse(padj < 0.05, "black", "lightgray"),  # Border color for significance
+    comparison = factor(comparison, levels = c("6 vs 0", "24 vs 0", "48 vs 0"))  # Explicit order of comparisons
+  )
+
+# Create the dotplot with genes sorted in reverse alphabetical order
+ggplot(filtered_res, aes(x = comparison, y = gene_label, fill = log2FoldChange, size = -log10(padj), color = border_color)) +
+  geom_point(shape = 21, stroke = 1.1) +  
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, limits = c(-2, 3), na.value = "red") +
+  scale_color_manual(values = c("black" = "black", "lightgray" = "lightgray"), guide = "none") +
+  scale_size_continuous(range = c(2, 8), limits = c(0.15, 35)) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 0, hjust = 0.5, vjust = 0.5, size = 12),  # Center text with hjust and vjust
+    axis.text.y = element_text(size = 11),
+    panel.grid.major = element_line(color = "lightgray", linetype = "dotted"),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "gray", linewidth = 1, fill = NA),  # Transparent inside the border
+    strip.text = element_text(size = 12),
+    plot.title = element_text(size = 15),
+    plot.margin = margin(10, 10, 10, 10)  # Adjust margins to avoid clipping
+  ) +
+  labs(x = NULL, y = NULL, fill = "Log2FC", size = "-Log10(padj)", color = NULL ) +
+  ggtitle("Ferroptosis Marker Genes") +
+  scale_x_discrete(labels = c("6 vs 0" = "T6", "24 vs 0" = "T24", "48 vs 0" = "T48"))
+```
+
+# Fig3 dds comparison endpoint GroupA & GroupB 
+```{r Fig3_dds_comparison_endpoint, eval = FALSE}
+dds_EndpointsAB <- dds[, !(dds$Time %in% c("6", "24", "96"))]
+dds_EndpointsAB$Time_Concat <- as.character(dds_EndpointsAB$Time_Concat)
+dds_EndpointsAB$Time_Concat[dds_EndpointsAB$Time_Concat %in% c("0A", "0B", "0C")] <- "Unperfused"
+dds_EndpointsAB$Time_Concat[dds_EndpointsAB$Time_Concat == "48A"] <- "GroupA"
+dds_EndpointsAB$Time_Concat[dds_EndpointsAB$Time_Concat == "48B"] <- "GroupB"
+dds_EndpointsAB$Time_Concat <- factor(dds_EndpointsAB$Time_Concat, levels = c("Unperfused", "GroupA", "GroupB"))
+
+design(dds_EndpointsAB) <- ~ Time_Concat
+dds_EndpointsAB <- DESeq(dds_EndpointsAB)
+# Use this dds in later chunks 
+```
+
+# Fig3H-I GSVA GroupA vs GroupB 
+```{r Fig3H-I_GSVA_GroupA_vs_GroupB, eval = FALSE}
+
+normalized_counts <- counts(dds_EndpointsAB, normalized=  TRUE)
+normalized_counts <- as.matrix(normalized_counts)
+log_transformed_counts <- log2(normalized_counts + 1)
+
+GSVA_of_interest <- c(
+  list( ferrdb_all_marker = ferrdb_all_marker,
+        WP_FERROPTOSIS = WP_FERROPTOSIS,
+        GOBP_IRON_ION_TRANSPORT = GOBP_IRON_ION_TRANSPORT))
+
+param <- gsvaParam(log_transformed_counts, GSVA_of_interest, minSize = 1)
+gsva_result <- gsva(param, verbose = TRUE)
+
+# Export GSVA results as CSV
+gsva_result_df <- as.data.frame(gsva_result)
+#write.csv(gsva_result_df, file = "GSVA_results_EndpointsAB.csv", row.names = TRUE)
+```
+
+# FigS6 DEG Endpoint GroupA & GroupB (VOLCANO PLOTS)
+```{r FigS6_DEG_Endpoint_GroupA_GroupB, eval = FALSE}
+# Define Comparisons
+time_points <- c("GroupA", "GroupB")
+titles <- c("GroupA vs Unperfused", "GroupB vs Unperfused")
+
+gene_lists <- list( #For labbeling !
+    ferrdb_all_marker = ferrdb_all_marker,
+    hallmark_inflammatory_response = HALLMARK_INFLAMMATORY_RESPONSE,
+    hallmark_tnfa_signaling = HALLMARK_TNFA_SIGNALING_VIA_NFKB,
+    hallmark_il6_jak_stat3 = HALLMARK_IL6_JAK_STAT3_SIGNALING)
+
+for (i in seq_along(time_points)) {
+    time <- time_points[i]
+    title <- titles[i]
+
+    # Get results for the specified time point
+    res <- results(dds_EndpointsAB, contrast = c("Time_Concat", time, "Unperfused"))
+    res <- data.frame(res)
+    res$Gene <- rownames(res)
+    res <- res[!is.na(res$padj), ]
+
+    for (gene_list_name in names(gene_lists)) {
+        current_gene_list <- gene_lists[[gene_list_name]]
+
+        # Assign colors based on gene list and significance
+        res$dot_color <- ifelse(
+            res$Gene %in% current_gene_list & res$padj < 0.05, "red", "lightgray"
+        )
+
+        # Order points for plotting
+        res$plot_order <- factor(res$dot_color, levels = c("lightgray", "red"))
+        res <- res[order(res$plot_order), ]
+
+        # Create the plot
+        plot <- ggplot(res, aes(x = log2FoldChange, y = -log10(padj), color = dot_color)) +
+            geom_point(size = 1.5) +
+            labs(
+                title = paste(title, "-", gene_list_name),
+                x = "Log2FC",
+                y = "-Log10(padj)"
+            ) +
+            theme_minimal() +
+            scale_color_identity(
+                guide = "legend",
+                name = NULL,
+                breaks = c("red", "lightgray"),
+                labels = c("Signature genes", "Other (gray)")
+            ) +
+            xlim(-10, 10) +
+            ylim(0, 60) +
+            theme(
+                panel.border = element_rect(color = "black", linewidth = 1, fill = NA),
+                plot.title = element_text(hjust = 0.5, size = 16),
+                axis.title.x = element_text(size = 14),
+                axis.title.y = element_text(size = 14),
+                axis.text.x = element_text(size = 12),
+                axis.text.y = element_text(size = 12),
+                legend.text = element_text(size = 12)
+            )
+
+        # Save the plot
+        plot_file <- paste0("VolcanoPlot_", time, "_", gene_list_name, ".pdf")
+        ggsave(plot_file, plot, width = 6, height = 4, dpi = 300, device = "pdf")
+    }} 
+```
+
+# FigS6 Log2FC Endpoint Group A vs Endpoint Group B  
+```{r FigS6_Log2FC_Endpoint_Group_A_Endpoint_Group_B, eval = FALSE}
+# Extract results for GroupA and GroupB
+res_GroupA <- results(dds_EndpointsAB, contrast = c("Time_Concat", "GroupA", "Unperfused"))
+res_GroupB <- results(dds_EndpointsAB, contrast = c("Time_Concat", "GroupB", "Unperfused"))
+
+# Convert to data frames
+res_GroupA <- data.frame(res_GroupA)
+res_GroupB <- data.frame(res_GroupB)
+
+# Add Gene column for merging
+res_GroupA$Gene <- rownames(res_GroupA)
+res_GroupB$Gene <- rownames(res_GroupB)
+
+# Merge by Gene
+merged_res <- merge(res_GroupA, res_GroupB, by = "Gene", suffixes = c("_GroupA", "_GroupB"))
+
+# Add a color column based on ferroptosis genes
+merged_res$dot_color <- ifelse(
+    merged_res$Gene %in% HALLMARK_IL6_JAK_STAT3_SIGNALING, "red", "lightgray"
+)
+
+# Define plot order based on color
+merged_res$plot_order <- factor(merged_res$dot_color, levels = c("lightgray", "red"))
+merged_res <- merged_res[order(merged_res$plot_order), ]
+
+# Create the plot
+ggplot(merged_res, aes(x = log2FoldChange_GroupA, y = log2FoldChange_GroupB, color = dot_color)) +
+    geom_point(size = 1.5) +
+    geom_abline(intercept = 0, slope = 1, color = "black", linetype = "dotted", size = 1) +  # Original thinner dotted line
+    labs(
+        title = "HALLMARK_IL6_JAK_STAT3_SIGNALING", x = "Log2FC (GroupA)", y = "Log2FC (GroupB)"
+    ) +
+    theme_minimal() +
+    scale_color_identity(
+        guide = "legend",
+        name = NULL,
+        breaks = c("red", "lightgray"),
+        labels = c("Pathway genes", "Other (gray)")
+    ) +
+    xlim(-10, 10) +  
+    ylim(-10, 10) +  
+    theme(
+        panel.border = element_rect(color = "black", linewidth = 1, fill = NA),
+        plot.title = element_text(hjust = 0.5, size = 16),
+        axis.title.x = element_text(size = 14),
+        axis.title.y = element_text(size = 14),
+        axis.text.x = element_text(size = 12),
+        axis.text.y = element_text(size = 12),
+        legend.text = element_text(size = 12)
+    )
+
+```
+
+# FigS6 Ferroptosis signature genes dotplot 
+```{r FigS6_Ferroptosis_signature_genes_dotplot, eval = FALSE}
+# Time points and titles for the comparisons
+time_points <- c("GroupA", "GroupB")
+titles <- c("GroupA vs Unperfused", "GroupB vs Unperfused")
+
+# List to store significant genes for each time point
+ferrdb_significant_genes <- list()
+
+# Loop through each time point to identify significant genes
+for (i in seq_along(time_points)) {
+    time <- time_points[i]
+    title <- titles[i]
+    
+    # Get results for the specified time point
+    res <- results(dds_EndpointsAB, contrast = c("Time_Concat", time, "Unperfused"))
+    res <- data.frame(res)
+    res$Gene <- rownames(res)
+    res <- res[!is.na(res$padj), ]
+    
+    # Filter for ferrdb_all genes with padj < 0.05 and abs(log2FoldChange) > 2
+    significant_res <- res[res$Gene %in% ferrdb_all_marker & res$padj < 0.05 & abs(res$log2FoldChange) > 2, ]
+    
+    # Add the significant genes to the list, categorized by time point
+    ferrdb_significant_genes[[time]] <- significant_res$Gene
+}
+
+# Combine all significant genes
+all_ferrdb_significant_genes <- unique(unlist(ferrdb_significant_genes))
+
+# Extract results for multiple comparisons
+res_GroupA <- results(dds_EndpointsAB, contrast = c("Time_Concat", "GroupA", "Unperfused"))
+res_GroupB <- results(dds_EndpointsAB, contrast = c("Time_Concat", "GroupB", "Unperfused"))
+
+# Add gene names and a column indicating the comparison
+res_GroupA$gene <- rownames(res_GroupA)
+res_GroupA$comparison <- "GroupA vs Unperfused"
+
+res_GroupB$gene <- rownames(res_GroupB)
+res_GroupB$comparison <- "GroupB vs Unperfused"
+
+# Combine the results from all comparisons
+combined_res <- bind_rows(as.data.frame(res_GroupA), as.data.frame(res_GroupB))
+
+# Filter combined results for significant FerrDB genes
+filtered_res <- combined_res %>% 
+  filter(gene %in% unlist(all_ferrdb_significant_genes)) %>% 
+  mutate(
+    gene_label = factor(gene, levels = sort(unique(gene))),  # Order genes alphabetically
+    border_color = ifelse(padj < 0.05, "black", "lightgray"),  # Border color for significance
+    comparison = factor(comparison, levels = c("GroupB vs Unperfused", "GroupA vs Unperfused"))  # Order comparisons explicitly
+  )
+
+# Create the dotplot
+ggplot(filtered_res, aes(x = gene_label, y = comparison, fill = log2FoldChange, size = -log10(padj), color = border_color)) +
+  geom_point(shape = 21, stroke = 1.1) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, na.value = "gray") +
+  scale_color_manual(values = c("black" = "black", "lightgray" = "lightgray"), guide = "none") +
+  scale_size_continuous(range = c(2, 8)) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, size = 11, color = "black"),  # Rotate X-axis text
+    axis.text.y = element_text(size = 13, color = "black"),
+    panel.grid.major = element_line(color = "lightgray", linetype = "dotted"),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "gray", linewidth = 1, fill = NA),
+    strip.text = element_text(size = 12),
+    plot.title = element_text(size = 15),
+    plot.margin = margin(10, 10, 10, 10)  # Adjust margins to avoid clipping
+  ) +
+  labs(x = NULL, y = NULL, fill = "Log2FC", size = "-Log10(padj)", color = NULL) +
+  scale_y_discrete(labels = c("GroupA vs Unperfused" = "GroupA", "GroupB vs Unperfused" = "GroupB")) +
+  ggtitle("Ferroptosis Signature Genes")
+```
+
+# Fig4 dds GroupA (RBCs) vs GroupC (Cell free) 
+```{r Fig4_dds_GroupA_GroupC, eval = FALSE}
+#Reassign names and make dds
+dds_EndpointsAC <- dds[, !(dds$Time %in% c("6", "24"))]
+dds_EndpointsAC <- dds_EndpointsAC[, !(dds_EndpointsAC$Time_Concat %in% c("48B"))]
+dds_EndpointsAC$Time_Concat <- as.character(dds_EndpointsAC$Time_Concat)
+dds_EndpointsAC$Time_Concat[dds_EndpointsAC$Time_Concat %in% c("0A", "0B", "0C")] <- "Unperfused"
+dds_EndpointsAC$Time_Concat[dds_EndpointsAC$Time_Concat == "48A"] <- "GroupA"
+dds_EndpointsAC$Time_Concat[dds_EndpointsAC$Time_Concat == "96C"] <- "GroupC"
+dds_EndpointsAC$Time_Concat <- factor(dds_EndpointsAC$Time_Concat, levels = c("Unperfused", "GroupA", "GroupC"))
+
+design(dds_EndpointsAC) <- ~ Time_Concat 
+dds_EndpointsAC <- DESeq(dds_EndpointsAC)
+# Use this dds in later chunks 
+```
+
+# Fig4I-K GSVA 
+```{r Fig4I-K_GSVA, eval = FALSE}
+
+normalized_counts <- counts(dds_EndpointsAC, normalized=  TRUE)
+normalized_counts <- as.matrix(normalized_counts)
+log_transformed_counts <- log2(normalized_counts + 1)
+
+GSVA_of_interest <- c(
+  list( ferrdb_all_marker = ferrdb_all_marker,
+        WP_FERROPTOSIS = WP_FERROPTOSIS,
+        GOBP_IRON_ION_TRANSPORT = GOBP_IRON_ION_TRANSPORT))
+
+param <- gsvaParam(log_transformed_counts, GSVA_of_interest, minSize = 1)
+gsva_result <- gsva(param, verbose = TRUE)
+
+# Export GSVA results as CSV
+gsva_result_df <- as.data.frame(gsva_result)
+#write.csv(gsva_result_df, file = "GSVA_results_EndpointsAC.csv", row.names = TRUE)
+```
+
+# Fig4L DEG VOLCANO PLOTS
+```{r Fig4L_DEG_VOLCANO_PLOTS, eval = FALSE}
+# Define Comparisons
+time_points <- c("GroupA", "GroupC")
+titles <- c("GroupA vs Unperfused", "GroupC vs Unperfused")
+
+for (i in seq_along(time_points)) {
+    time <- time_points[i]
+    title <- titles[i] 
+
+    # Get results for the specified time point
+    res <- results(dds_EndpointsAC, contrast = c("Time_Concat", time, "Unperfused"))
+    res <- data.frame(res)
+    res$Gene <- rownames(res)
+    res <- res[!is.na(res$padj), ]
+
+     res$dot_color <- ifelse(
+        res$Gene %in% ferrdb_all_marker & res$padj < 0.05, "red", "lightgray")
+
+    res$plot_order <- factor(res$dot_color, levels = c("lightgray", "red"))
+    res <- res[order(res$plot_order), ]
+
+    # Create the plot
+    plot <- ggplot(res, aes(x = log2FoldChange, y = -log10(padj), color = dot_color)) +
+        geom_point(size = 1.5) +
+        labs(title = title, x = "Log2FC", y = "-Log10(padj)") +
+        theme_minimal() +
+        scale_color_identity(
+            guide = "legend",
+            name = NULL,
+            breaks = c("red", "lightgray"),
+            labels = c("Ferroptosis signature genes", "Other (gray)")
+        ) +
+        xlim(-10, 10) +
+        ylim(0, 100) +
+        theme(
+            panel.border = element_rect(color = "black", linewidth = 1, fill = NA),
+            plot.title = element_text(hjust = 0.5, size = 16),
+            axis.title.x = element_text(size = 14),
+            axis.title.y = element_text(size = 14),
+            axis.text.x = element_text(size = 12),
+            axis.text.y = element_text(size = 12),
+            legend.text = element_text(size = 12)
+        )
+    plot_file <- paste0("VolcanoPlot_", time, "_vs_unperfused.pdf")
+    ggsave(plot_file, plot, width = 5.5, height = 4, dpi = 300, device = "pdf")
+    }
+```
+
+# Fig4M Ferroptosis signature genes dotplot 
+```{r Fig4M_Ferroptosis_signature_genes_dotplot, eval = FALSE}
+time_points <- c("GroupA", "GroupC")
+titles <- c("GroupA vs Unperfused", "GroupC vs Unperfused")
+
+res_GroupA <- results(dds_EndpointsAC, contrast = c("Time_Concat", "GroupA", "Unperfused"))
+res_GroupC <- results(dds_EndpointsAC, contrast = c("Time_Concat", "GroupC", "Unperfused"))
+
+# Add gene names and a column indicating the comparison
+res_GroupA$gene <- rownames(res_GroupA)
+res_GroupA$comparison <- "GroupA vs Unperfused"
+res_GroupC$gene <- rownames(res_GroupC)
+res_GroupC$comparison <- "GroupC vs Unperfused"
+
+# Combine the results from all comparisons
+combined_res <- bind_rows(as.data.frame(res_GroupA), as.data.frame(res_GroupC))
+
+# Filter combined results for genes in the ferrdb_marker list
+filtered_res <- combined_res %>%
+  filter(gene %in% ferrdb_all_marker, abs(log2FoldChange) > 2) %>%  # Filter for Log2FC >2 or <-2
+  mutate(
+    gene_label = factor(gene, levels = rev(sort(ferrdb_all_marker))),  # Reverse alphabetical sorting
+    border_color = ifelse(padj < 0.05, "black", "lightgray"),  # Border color for significance
+    comparison = factor(comparison, levels = c("GroupA vs Unperfused", "GroupC vs Unperfused"))  # Explicit order of comparisons
+  )
+
+# Create the dotplot with genes sorted in reverse alphabetical order
+ggplot(filtered_res, aes(x = comparison, y = gene_label, fill = log2FoldChange, size = -log10(padj), color = border_color)) +
+  geom_point(shape = 21, stroke = 1.1) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, na.value = "gray") +
+  scale_color_manual(values = c("black" = "black", "lightgray" = "lightgray"), guide = "none") +
+  scale_size_continuous(range = c(2, 8)) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 0, hjust = 0.5, vjust = 0.5, size = 12),  # Center text with hjust and vjust
+    axis.text.y = element_text(size = 11),
+    panel.grid.major = element_line(color = "lightgray", linetype = "dotted"),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "gray", linewidth = 1, fill = NA),  # Transparent inside the border
+    strip.text = element_text(size = 12),
+    plot.title = element_text(size = 15),
+    plot.margin = margin(10, 10, 10, 10)  # Adjust margins to avoid clipping
+  ) +
+  labs(x = NULL, y = NULL, fill = "Log2FC", size = "-Log10(padj)", color = NULL) +
+  ggtitle("Ferroptosis Marker Genes") +
+  scale_x_discrete(labels = c("GroupA vs Unperfused" = "GroupA", "GroupC vs Unperfused" = "GroupC"))
+```
+
+# FigS2 Effect of cold preservation 
+```{r FigS2, eval = FALSE}
+## DDS for Baseline SCS and HMP ##
+dds_baseline <- dds[, !(dds$Time %in% c("6", "24", "48", "96"))]
+dds_baseline$Time <- NULL
+dds_baseline$Preservation <- factor(dds_baseline$Preservation, levels = c("SCS", "HMP"))  # Add all levels here
+design(dds_baseline) <- ~ Preservation
+dds_baseline <- DESeq(dds_baseline)
+
+# PCA for baseline samples
+vsd <- vst(dds_baseline, blind = FALSE)
+vsd_data <- assay(vsd)
+
+calculate_pca_matrix <- function(matrix, intgroup = "condition", ntop = 5000) {  
+  rv <- rowVars(matrix)
+  select <- order(rv, decreasing = TRUE)[seq_len(min(ntop, length(rv)))]
+  pca <- prcomp(t(matrix[select, ]), scale. = FALSE)
+  percent_var <- pca$sdev^2 / sum(pca$sdev^2) * 100
+  pca_data <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], colData(dds_baseline)[, intgroup, drop = FALSE])
+  list(pca_data = pca_data, percent_var = percent_var, pca_loadings = pca$rotation)
+}
+pca_result <- calculate_pca_matrix(vsd_data, intgroup = c("Group", "Preservation"))
+pca_data <- pca_result$pca_data
+percent_var <- pca_result$percent_var
+pca_loadings <- pca_result$pca_loadings  
+
+pca_data$Group <- colData(dds_baseline)$Time_Concat
+pca_data$Preservation <- colData(dds_baseline)$Preservation
+pca_data$Donor <- colData(dds_baseline)
+
+pca_plot <- ggplot(pca_data, aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = Preservation, shape = Group, fill = Preservation), size = 4) +  
+  theme_bw() +
+  labs(
+    x = paste0("PC1: ", round(percent_var[1], 1), "% variance"),
+    y = paste0("PC2: ", round(percent_var[2], 1), "% variance"),
+    color = "Preservation",
+    shape = "Group",
+    fill = "Preservation" ) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.title.x = element_text(size = 14),  
+    axis.title.y = element_text(size = 14),  
+    axis.text.x = element_text(size = 12),   
+    axis.text.y = element_text(size = 12),   
+    legend.text = element_text(size = 12),
+    legend.title = element_text(size = 14)
+  )   +
+    scale_color_manual(values = c("HMP" = "black", "SCS" = "deepskyblue")) +   
+    scale_shape_manual(values = c("0A" = 16, "0B" = 18, "0C" = 15)) +  
+    scale_fill_manual(values = c("HMP" = "black", "SCS" = "deepskyblue"))  
+
+print(pca_plot)
+
+# Heatmap PC1 & PC2
+annotation_col <- data.frame(Preservation = colData(dds_baseline)$Preservation)
+annotation_colors <- list(Preservation = c("HMP" = "black", "SCS" = "deepskyblue"))
+rownames(annotation_col) <- colnames(vsd_data)  # Ensure row names match sample names
+
+top_genes_pc1 <- order(abs(pca_loadings[,1]), decreasing = TRUE)[1:100]  
+top_genes_pc2 <- order(abs(pca_loadings[,2]), decreasing = TRUE)[1:100]  
+top_genes_pc1_names <- rownames(pca_loadings)[top_genes_pc1]  # Genes for PC1
+top_genes_pc2_names <- rownames(pca_loadings)[top_genes_pc2]  # Genes for PC2
+
+vsd_subset_top_pc1 <- vsd_data[top_genes_pc1_names, , drop = FALSE]
+vsd_subset_top_pc2 <- vsd_data[top_genes_pc2_names, , drop = FALSE]
+
+pheatmap(
+  vsd_subset_top_pc1,
+  scale = "row",
+  clustering_distance_rows = "euclidean",
+  clustering_distance_cols = "euclidean",
+  clustering_method = "complete",
+  annotation_col = annotation_col,
+  annotation_colors = annotation_colors,  
+  main = "Top 100 Genes PC1",
+  show_rownames = FALSE,  
+  show_colnames = FALSE   
+)
+
+pheatmap(
+  vsd_subset_top_pc2,
+  scale = "row",
+  clustering_distance_rows = "euclidean",
+  clustering_distance_cols = "euclidean",
+  clustering_method = "complete",
+  annotation_col = annotation_col,
+  annotation_colors = annotation_colors,  
+  main = "Top 100 Genes PC2",
+  show_rownames = FALSE,  
+  show_colnames = FALSE   
+)
+
+
+# DEG HMP vs SCS (Volcano plot)
+res <- results(dds_baseline, contrast = c("Preservation", "HMP", "SCS"))
+res <- res[!is.na(res$padj) & !is.na(res$log2FoldChange), ]
+res$padj[res$padj == 0] <- 1e-100
+
+res$dot_color <- ifelse(res$padj < 0.05 & res$log2FoldChange > 0, "black", 
+                        ifelse(res$padj < 0.05 & res$log2FoldChange < 0, "deepskyblue", "gray"))
+
+ggplot(res, aes(x = log2FoldChange, y = -log10(padj), color = dot_color)) +
+  geom_point(size = 1.5, alpha = 0.7) +
+  labs(
+    title = "HMP vs SCS",
+    x = "Log2FC",
+    y = "-Log10(padj)"
+  ) +
+  scale_color_identity() +
+  xlim(-4, 4) + 
+  ylim(0, 10) + 
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16),
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 14),
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    legend.position = "none",  # No legend
+    panel.border = element_rect(color = "black", linewidth = 1, fill = NA)
+  )
+```
+
+# Reviewer 2 Question 1 Inflammatory response Oxirs vs HF20
+```{r FigS2 , eval = FALSE}
+dds_GroupAB <- dds[, !(dds$Group %in% c("C"))]
+dds_GroupAB$Time <- factor(dds_GroupAB$Time, levels = c("0", "6", "24", "48"))  # Add all levels here
+dds_GroupAB$Perfusate_fHb <- as.numeric(dds_GroupAB$Perfusate_fHb)
+design(dds_GroupAB) <- ~ Time + Perfusate_fHb
+dds_GroupAB <- DESeq(dds_GroupAB)
+
+# PCA 
+vsd <- vst(dds_GroupAB, blind = FALSE)
+vsd_data <- assay(vsd)
+
+calculate_pca_matrix <- function(matrix, intgroup = "condition", ntop = 5000) {  
+  rv <- rowVars(matrix)
+  select <- order(rv, decreasing = TRUE)[seq_len(min(ntop, length(rv)))]
+  pca <- prcomp(t(matrix[select, ]), scale. = FALSE)
+  percent_var <- pca$sdev^2 / sum(pca$sdev^2) * 100
+  pca_data <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], colData(dds_GroupAB)[, intgroup, drop = FALSE])
+  list(pca_data = pca_data, percent_var = percent_var, pca_loadings = pca$rotation)
+}
+
+pca_result <- calculate_pca_matrix(vsd_data, intgroup = c("Time", "Group"))
+pca_data <- pca_result$pca_data
+percent_var <- pca_result$percent_var
+pca_loadings <- pca_result$pca_loadings  # Extract PCA loadings
+
+pca_data$Time <- colData(dds_GroupAB)$Time
+pca_data$Group <- colData(dds_GroupAB)$Group
+pca_data$Preservation <- colData(dds_GroupAB)$Preservation
+
+# Create PCA plot with ggplot2
+pca_plot <- ggplot(pca_data, aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = Group, shape = Time), size = 4) +  # Plot points
+  theme_bw() +
+  labs(
+    x = paste0("PC1: ", round(percent_var[1], 1), "% variance"),
+    y = paste0("PC2: ", round(percent_var[2], 1), "% variance"),
+    color = "Group",
+    shape = "Time"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.title.x = element_text(size = 14),  # Change size of x-axis title
+    axis.title.y = element_text(size = 14),  # Change size of y-axis title
+    axis.text.x = element_text(size = 12),   # Change size of x-axis numbers
+    axis.text.y = element_text(size = 12),   # Change size of y-axis numbers
+    legend.text = element_text(size = 12),
+    legend.title = element_text(size = 14)
+  ) +
+  scale_shape_manual(values = c("0" = 15, "6" = 17, "24" = 18,  "48" = 16)) +
+  scale_color_manual(values = c("Unperfused" = "gray", "A" = "red", "B" = "orange"))
+  
+
+print(pca_plot)
+
+# Define Comparisons
+time_points <- c("6A", "6B", "24A", "24B", "48A", "48B")
+titles <- paste(time_points, "vs 0")
+
+# Define gene lists for coloring
+gene_lists <- list(
+    hallmark_inflammatory_response = HALLMARK_INFLAMMATORY_RESPONSE,
+    hallmark_tnfa_signaling = HALLMARK_TNFA_SIGNALING_VIA_NFKB,
+    hallmark_il6_jak_stat3 = HALLMARK_IL6_JAK_STAT3_SIGNALING
+)
+
+for (i in seq_along(time_points)) {
+    time <- time_points[i]
+    title <- titles[i]
+
+    # Get results for the specified time point
+    res <- results(dds_GroupAB, contrast = c("Time_Concat", time, "0"))
+    res <- data.frame(res)
+    res$Gene <- rownames(res)
+    res <- res[!is.na(res$padj), ]
+
+    for (gene_list_name in names(gene_lists)) {
+        current_gene_list <- gene_lists[[gene_list_name]]
+
+        # Assign colors based on gene list and significance
+        res$dot_color <- ifelse(
+            res$Gene %in% current_gene_list & res$padj < 0.05, "red", "lightgray"
+        )
+
+        # Order points for plotting
+        res$plot_order <- factor(res$dot_color, levels = c("lightgray", "red"))
+        res <- res[order(res$plot_order), ]
+
+        # Create the plot
+        plot <- ggplot(res, aes(x = log2FoldChange, y = -log10(padj), color = dot_color)) +
+            geom_point(size = 1.5) +
+            labs(
+                title = paste(title, "-", gene_list_name),
+                x = "Log2FC",
+                y = "-Log10(padj)"
+            ) +
+            theme_minimal() +
+            scale_color_identity(
+                guide = "legend",
+                name = NULL,
+                breaks = c("red", "lightgray"),
+                labels = c("Signature genes", "Other (gray)")
+            ) +
+            xlim(-10, 10) +
+            ylim(0, 60) +
+            theme(
+                panel.border = element_rect(color = "black", linewidth = 1, fill = NA),
+                plot.title = element_text(hjust = 0.5, size = 16),
+                axis.title.x = element_text(size = 14),
+                axis.title.y = element_text(size = 14),
+                axis.text.x = element_text(size = 12),
+                axis.text.y = element_text(size = 12),
+                legend.text = element_text(size = 12)
+            )
+
+        # Save the plot
+        plot_file <- paste0("VolcanoPlot_", time, "_", gene_list_name, ".pdf")
+        ggsave(plot_file, plot, width = 6, height = 4, dpi = 300, device = "pdf")
+    }
+}
+
+## PLOT LOG2FCs for each timepoint against each other
+# Define comparisons
+time_pairs <- list(
+    "6A_vs_6B" = c("6A", "6B"),
+    "24A_vs_24B" = c("24A", "24B"),
+    "48A_vs_48B" = c("48A", "48B")
+)
+
+# Define gene lists for coloring
+gene_lists <- list(
+    ferrdb_all_marker = ferrdb_all_marker,
+    hallmark_inflammatory_response = HALLMARK_INFLAMMATORY_RESPONSE,
+    hallmark_tnfa_signaling = HALLMARK_TNFA_SIGNALING_VIA_NFKB,
+    hallmark_il6_jak_stat3 = HALLMARK_IL6_JAK_STAT3_SIGNALING
+)
+
+# Loop through comparisons
+for (comparison_name in names(time_pairs)) {
+    times <- time_pairs[[comparison_name]]
+    time1 <- times[1]
+    time2 <- times[2]
+
+    # Extract results for each time point
+    res_time1 <- results(dds_GroupAB, contrast = c("Time_Concat", time1, "0"))
+    res_time2 <- results(dds_GroupAB, contrast = c("Time_Concat", time2, "0"))
+
+    # Convert to data frames
+    res_time1 <- data.frame(res_time1)
+    res_time2 <- data.frame(res_time2)
+
+    # Add Gene column for merging
+    res_time1$Gene <- rownames(res_time1)
+    res_time2$Gene <- rownames(res_time2)
+
+    # Merge results by Gene
+    merged_res <- merge(res_time1, res_time2, by = "Gene", suffixes = c(paste0("_", time1), paste0("_", time2)))
+
+    for (gene_list_name in names(gene_lists)) {
+        current_gene_list <- gene_lists[[gene_list_name]]
+
+        # Add a color column based on the current gene list
+        merged_res$dot_color <- ifelse(
+            merged_res$Gene %in% current_gene_list, "red", "lightgray"
+        )
+
+        # Define plot order based on color
+        merged_res$plot_order <- factor(merged_res$dot_color, levels = c("lightgray", "red"))
+        merged_res <- merged_res[order(merged_res$plot_order), ]
+
+        # Create the plot
+        plot <- ggplot(merged_res, aes_string(
+            x = paste0("log2FoldChange_", time1),
+            y = paste0("log2FoldChange_", time2),
+            color = "dot_color"
+        )) +
+            geom_point(size = 1.5) +
+            geom_abline(intercept = 0, slope = 1, color = "black", linetype = "dotted", size = 1) +
+            labs(
+                title = paste(gene_list_name, "-", comparison_name),
+                x = paste("Log2FC (", time1, ")", sep = ""),
+                y = paste("Log2FC (", time2, ")", sep = "")
+            ) +
+            theme_minimal() +
+            scale_color_identity(
+                guide = "legend",
+                name = NULL,
+                breaks = c("red", "lightgray"),
+                labels = c("Pathway genes", "Other (gray)")
+            ) +
+            xlim(-10, 10) +
+            ylim(-10, 10) +
+            theme(
+                panel.border = element_rect(color = "black", linewidth = 1, fill = NA),
+                plot.title = element_text(hjust = 0.5, size = 16),
+                axis.title.x = element_text(size = 14),
+                axis.title.y = element_text(size = 14),
+                axis.text.x = element_text(size = 12),
+                axis.text.y = element_text(size = 12),
+                legend.text = element_text(size = 12)
+            )
+
+        # Save the plot
+        plot_file <- paste0("ScatterPlot_", comparison_name, "_", gene_list_name, ".pdf")
+        ggsave(plot_file, plot, width = 6, height = 4, dpi = 300, device = "pdf")
+    }
+}
+```
