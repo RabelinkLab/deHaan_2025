@@ -1,5 +1,5 @@
-# deHaan_Jacobs_2025
-This repository hosts the script for the analysis of of bulk transcriptomics for perfused kidneys as discussed in the manuscript of De Haan, Jacobs et al, 2025. \
+# deHaan_2025
+This repository hosts the script for the analysis of of bulk transcriptomics for perfused kidneys as discussed in the manuscript of De Haan et al, 2025. \
 **Insert Image of Manuscript**
 
 DOI: **Insert DOI** \
