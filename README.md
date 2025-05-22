@@ -3,7 +3,7 @@ This repository hosts the script for the analysis of of bulk transcriptomics for
 **Insert Image of Manuscript**
 
 DOI: **Insert DOI** \
-GEO: **Insert GEO** \
+GEO: **GSE289688** \
 BulkRNAseq_KidneypPerfusion.Rmd contains the code for full analysis including the figures 
 
 
